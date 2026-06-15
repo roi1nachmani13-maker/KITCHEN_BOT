@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  kitchen-bot:
+    build: .
+    container_name: kitchen-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount service account JSON if using file path
+      - ./service_account.json:/app/service_account.json:ro
+      # Persistent backups
+      - ./backups:/app/backups
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Optional: automatic daily backup via cron-like scheduler
+  backup:
+    build: .
+    container_name: kitchen-bot-backup
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./service_account.json:/app/service_account.json:ro
+      - ./backups:/app/backups
+    command: >
+      sh -c "while true; do
+        sleep 86400;
+        python scripts/backup.py /app/backups;
+      done"
+    depends_on:
+      - kitchen-bot
+    profiles:
+      - backup
