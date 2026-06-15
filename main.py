@@ -1,6 +1,9 @@
 """Kitchen Bot - main entry point."""
 from __future__ import annotations
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram import BotCommand
 from telegram.ext import (
     Application, CallbackQueryHandler,
@@ -18,8 +21,26 @@ from src.sheets.client import sheets_client
 from src.sheets.inventory import inventory_manager
 from src.utils.config import config
 from src.utils.logger import get_logger
+import os
 
 log = get_logger("main")
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info(f"Health server on port {port}")
 
 
 async def post_init(application: Application) -> None:
@@ -68,6 +89,7 @@ def build_application() -> Application:
 
 def main() -> None:
     log.info("Starting Kitchen Bot...")
+    start_health_server()
     build_application().run_polling(
         drop_pending_updates=True,
         allowed_updates=["message", "callback_query"],
