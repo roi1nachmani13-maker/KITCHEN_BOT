@@ -13,6 +13,7 @@ class Intent(str, Enum):
     MARK_DONE = "mark_done"
     CANCEL = "cancel"
     RESTORE = "restore"
+    COUNT = "count"
     UNKNOWN = "unknown"
 
 
@@ -94,3 +95,24 @@ def detect_intent_prefix(text: str) -> tuple[Intent, str]:
 
     # No keyword prefix - treat as ADD (bare product name/qty)
     return Intent.ADD, text
+
+
+# ---- Evening count patterns ----
+COUNT_PATTERNS: List[str] = [
+    r"^נשאר\s",
+    r"^נשארה\s",
+    r"^נשארו\s",
+    r"^יש\s",
+    r"^נותר\s",
+    r"^נותרה\s",
+    r"^נותרו\s",
+    r"^ספירה\s",
+]
+
+
+def _add_count_patterns() -> None:
+    global _COMPILED
+    _COMPILED[Intent.COUNT] = [re.compile(p, re.IGNORECASE) for p in COUNT_PATTERNS]
+
+
+_add_count_patterns()

@@ -152,3 +152,7 @@ class MessageParser:
 
 # Module-level instance (product names loaded at startup)
 parser = MessageParser()
+
+
+# Import COUNT intent support
+from src.nlp.intents import Intent as _Intent

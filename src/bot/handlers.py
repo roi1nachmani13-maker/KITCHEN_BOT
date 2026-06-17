@@ -1,7 +1,6 @@
 """
 Main message handler: parses free text and routes to the right action.
-Also handles callback queries from inline keyboards.
-Supports multi-line messages (one product per line).
+Supports multi-line messages and evening count (ספירת ערב).
 """
 from __future__ import annotations
 
@@ -13,6 +12,7 @@ from src.bot.middlewares import rate_limited
 from src.nlp.intents import Intent
 from src.nlp.parser import parser, ParsedMessage
 from src.sheets.completions import completions_manager
+from src.sheets.evening_count import evening_manager
 from src.sheets.history import history_manager
 from src.sheets.inventory import inventory_manager
 from src.utils.logger import get_logger
@@ -20,6 +20,12 @@ from src.utils.logger import get_logger
 log = get_logger(__name__)
 
 CONFIRM_THRESHOLD = 0.85
+
+# Words to ignore completely
+IGNORE_WORDS = {
+    "היי", "הי", "שלום", "בוקר טוב", "ערב טוב", "תודה", "אוקי", "אוקיי",
+    "כן", "לא", "בסדר", "טוב", "נהדר", "מעולה", "ok", "yes", "no", "hi", "hello"
+}
 
 
 def _get_username(update: Update) -> str:
@@ -29,28 +35,31 @@ def _get_username(update: Update) -> str:
     return "unknown"
 
 
+def _should_ignore(text: str) -> bool:
+    return text.strip().lower() in IGNORE_WORDS
+
+
 @rate_limited
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text or ""
     actor = _get_username(update)
 
-    # Multi-line support: split by newline and process each line
+    if _should_ignore(text):
+        return
+
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
 
     if len(lines) > 1:
         await _handle_multi_line(update, context, lines, actor)
         return
 
-    # Single line
     parsed = parser.parse(text)
     if parsed is None:
         return
 
     if parsed.suggestion and parsed.confidence < CONFIRM_THRESHOLD:
         context.user_data["pending_message"] = {
-            "parsed": parsed,
-            "actor": actor,
-            "original": text,
+            "parsed": parsed, "actor": actor, "original": text,
         }
         await update.message.reply_text(
             f"התכוונת ל-{parsed.suggestion}?",
@@ -68,55 +77,59 @@ async def _handle_multi_line(
     actor: str,
 ) -> None:
     results = []
-    skipped = []
+    needs_confirm = []
 
     for line in lines:
-        parsed = parser.parse(line)
-        if parsed is None:
-            skipped.append(line)
+        if _should_ignore(line):
             continue
 
-        if parsed.intent == Intent.ADD:
+        parsed = parser.parse(line)
+        if parsed is None:
+            continue
+
+        # Fuzzy match needs confirmation - collect for later
+        if parsed.suggestion and parsed.confidence < CONFIRM_THRESHOLD:
+            needs_confirm.append((line, parsed.suggestion))
+            continue
+
+        if parsed.intent == Intent.COUNT:
+            result = evening_manager.update_count(
+                parsed.product_name, parsed.quantity, actor,
+                unit=parsed.unit or ""
+            )
+            history_manager.log_action("ספירת ערב", parsed.product_name, actor, line, str(parsed.quantity))
+            results.append(f"✅ נשאר {parsed.product_name} – {parsed.quantity}")
+
+        elif parsed.intent == Intent.ADD:
             inv_product = inventory_manager.get_product(parsed.product_name)
-            unit = parsed.unit or ""
             if inv_product:
                 result = completions_manager.add_or_update(
-                    name=parsed.product_name,
-                    qty=parsed.quantity,
-                    reporter=actor,
+                    name=parsed.product_name, qty=parsed.quantity, reporter=actor,
                 )
-                history_manager.log_action(
-                    action="הוספת חוסר" if result["action"] == "added" else "עדכון כמות",
-                    product_name=parsed.product_name,
-                    actor=actor,
-                    original_message=line,
-                    qty=str(parsed.quantity),
-                    unit=unit or result.get("unit", ""),
-                )
-                unit_str = unit or result.get("unit", "")
+                unit_str = parsed.unit or result.get("unit", "")
                 if result["action"] == "added":
                     results.append(f"✅ {parsed.product_name} – {parsed.quantity} {unit_str}".strip())
                 else:
                     results.append(f"🔄 {parsed.product_name} – {result.get('old_qty')} → {result.get('new_qty')} {unit_str}".strip())
+                history_manager.log_action("הוספת חוסר", parsed.product_name, actor, line, str(parsed.quantity))
             else:
-                # Add to inventory automatically and then to completions
                 inventory_manager.add_product(parsed.product_name)
-                completions_manager.add_or_update(
-                    name=parsed.product_name,
-                    qty=parsed.quantity,
-                    reporter=actor,
-                )
-                history_manager.log_action("הוספת מוצר חדש", parsed.product_name, actor, line, str(parsed.quantity), unit)
+                completions_manager.add_or_update(parsed.product_name, parsed.quantity, actor)
+                history_manager.log_action("הוספת מוצר חדש", parsed.product_name, actor, line, str(parsed.quantity))
                 parser.update_product_names(inventory_manager.get_all_product_names())
-                results.append(f"➕ {parsed.product_name} – {parsed.quantity} {unit}".strip() + " (חדש)")
-        else:
-            await _process_parsed(update, context, parsed, actor)
+                results.append(f"➕ {parsed.product_name} – {parsed.quantity} (חדש)")
 
+    msg = ""
     if results:
-        summary = "\n".join(results)
-        if skipped:
-            summary += f"\n\nדולג: {', '.join(skipped)}"
-        await update.message.reply_text(f"נוספו {len(results)} פריטים:\n\n{summary}")
+        msg += f"עודכנו {len(results)} פריטים:\n\n" + "\n".join(results)
+
+    if needs_confirm:
+        msg += "\n\nנדרש אישור:\n"
+        for original, suggestion in needs_confirm:
+            msg += f"• {original} → התכוונת ל-{suggestion}?\n"
+
+    if msg:
+        await update.message.reply_text(msg)
 
 
 async def _process_parsed(
@@ -130,7 +143,9 @@ async def _process_parsed(
     unit = parsed.unit
     original = parsed.original_text
 
-    if parsed.intent == Intent.ADD:
+    if parsed.intent == Intent.COUNT:
+        await _handle_count(update, context, name, qty, unit, actor, original)
+    elif parsed.intent == Intent.ADD:
         await _handle_add(update, context, name, qty, unit, actor, original)
     elif parsed.intent == Intent.MARK_DONE:
         await _handle_done(update, context, name, actor, original)
@@ -140,9 +155,19 @@ async def _process_parsed(
         await _handle_restore(update, context, name, actor, original)
 
 
+async def _handle_count(update, context, name, qty, unit, actor, original) -> None:
+    """Handle evening count - worker reports what's left."""
+    result = evening_manager.update_count(name, qty, actor, unit or "")
+    history_manager.log_action("ספירת ערב", name, actor, original, str(qty), unit or "")
+
+    action = "עודכן" if result["action"] == "updated" else "נרשם"
+    await update.message.reply_text(
+        f"✅ {action}: נשאר {name} – {qty} {unit or ''}".strip()
+    )
+
+
 async def _handle_add(update, context, name, qty, unit, actor, original) -> None:
     inv_product = inventory_manager.get_product(name)
-
     if inv_product is None:
         context.user_data["pending_add"] = {
             "name": name, "qty": qty, "unit": unit, "actor": actor, "original": original
@@ -153,10 +178,7 @@ async def _handle_add(update, context, name, qty, unit, actor, original) -> None
         )
         return
 
-    result = completions_manager.add_or_update(
-        name=name, qty=qty, reporter=actor,
-        notes=f"יחידה: {unit}" if unit else "",
-    )
+    result = completions_manager.add_or_update(name=name, qty=qty, reporter=actor)
     history_manager.log_action(
         action="הוספת חוסר" if result["action"] == "added" else "עדכון כמות",
         product_name=name, actor=actor, original_message=original,
@@ -169,10 +191,8 @@ async def _handle_add(update, context, name, qty, unit, actor, original) -> None
             reply_markup=status_keyboard(name),
         )
     else:
-        old = result.get("old_qty", 0)
-        new = result.get("new_qty", qty)
         await update.message.reply_text(
-            f"עודכן: {name}\n{old} -> {new} {unit_str}".strip(),
+            f"עודכן: {name}\n{result.get('old_qty')} → {result.get('new_qty')} {unit_str}".strip(),
         )
 
 

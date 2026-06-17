@@ -25,6 +25,8 @@ SCOPES = [
 SHEET_INVENTORY = "מלאי קבוע"
 SHEET_COMPLETIONS = "השלמות להיום"
 SHEET_HISTORY = "היסטוריה"
+SHEET_EVENING = "ספירת ערב"
+SHEET_AUTO_COMPLETIONS = "השלמות אוטומטיות"
 
 # Column definitions
 INVENTORY_HEADERS = [
